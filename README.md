@@ -300,9 +300,9 @@ This repository and all projects within it are released under the **MIT License*
 
 | راه ارتباطی | آدرس |
 |---|---|
-| **GitHub** | [@username](https://github.com/username) |
-| **Email** | [your-email@example.com](mailto:your-email@example.com) |
-| **LinkedIn** | [linkedin.com/in/username](https://linkedin.com/in/username) |
+| **GitHub** | [@username](https://github.com/rasoulpourfeiz) |
+| **Email** | [your-email@example.com](mailto:rasoul.pourfeiz@yahoo.com) |
+| **LinkedIn** | [linkedin.com/in/username](https://linkedin.com/in/rasoulpourfeiz) |
 
 </div>
 
