@@ -302,7 +302,7 @@ This repository and all projects within it are released under the **MIT License*
 |---|---|
 | **GitHub** | [@rasoulpourfeiz](https://github.com/rasoulpourfeiz) |
 | **Email** | [rasoul.pourfeiz@yahoo.com](mailto:rasoul.pourfeiz@yahoo.com) |
-| **LinkedIn** | [rasoulpourfeiz](https://linkedin.com/in/rasoulpourfeiz) |
+| **LinkedIn** | [rasoulpourfeiz](https://[linkedin.com/in/rasoulpourfeiz](https://ir.linkedin.com/in/rasoul-pourfeizollah-24b6b696/fa)) |
 
 </div>
 
