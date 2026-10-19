@@ -13,6 +13,7 @@
 
 ```bash
 pip install pandas openpyxl
+pip install pyinstaller
 ```
 
 ---
