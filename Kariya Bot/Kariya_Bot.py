@@ -1,82 +1,185 @@
-pip install playwright!
-# ============================ تنظیمات ============================
-CDP_URL = "http://127.0.0.1:9222"
-PAGE_URL_PART = "https://new.kariyahesab.com/acc"
+# -*- coding: utf-8 -*-
+# Kariya Hesab -> Moadian auto send + inquiry (Playwright, Windows 10)
+#
+# Flow:
+#   1) Scan pages from the first (newest) page and collect un-sent invoices.
+#      Scanning STOPS as soon as STOP_AFTER_EMPTY_PAGES consecutive pages have no
+#      un-sent invoice (older pages are all "sent", so they are never checked).
+#   2) Sort the collected invoices by number (smallest/oldest first).
+#   3) For each invoice: SEND it -> INQUIRE that same invoice -> next invoice.
+#   4) Optional extra inquiry rounds ONLY for invoices of this run still pending.
 
-DO_SEND = True             # مرحله‌ی ارسال
-DO_INQUIRY = True          # مرحله‌ی استعلام
-MAX_SEND = None               # برای تست: 1 یا 2  |  بعد از تست: None (بدون محدودیت)
-
-SEND_TIMEOUT = 90          # حداکثر انتظار (ثانیه) برای تمام شدن ارسال هر فاکتور
-INQUIRY_SETTLE = 6         # حداکثر انتظار (ثانیه) برای جواب هر استعلام
-INQUIRY_ROUNDS = 2         # چند دور استعلام برای فاکتورهای بدون جواب
-ROUND_WAIT = 30            # فاصله بین دورهای استعلام (ثانیه)
-PAGE_SETTLE = 2            # صبر بعد از عوض شدن صفحه‌ی جدول (ثانیه)
-DELAY_BETWEEN = 1.0        # مکث کوتاه بین فاکتورها (ثانیه)
-
-ROW = "tr"                 # اگر جدول از div ساخته شده بود این را عوض کنید
-# ================================================================
+import argparse
 import csv
+import os
 import re
-import threading
+import sys
 import time
+import traceback
+import unicodedata
 from datetime import datetime
 
 from playwright.sync_api import sync_playwright
 
-STOP = threading.Event()   # با STOP.set() می‌توانید اجرا را متوقف کنید
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
-Z = r"[\s\u200c]*"  # فاصله یا نیم‌فاصله
-RE_UNSENT = re.compile(rf"ارسال{Z}نشده")
+# ============================ SETTINGS ============================
+CDP_URL = "http://127.0.0.1:9222"
+URL_PART = "kariyahesab.com"
+
+DO_SEND = True
+DO_INQUIRY = True
+MAX_SEND = None            # None = all (can be set from the .bat with --max N)
+
+STOP_AFTER_EMPTY_PAGES = 2 # stop scanning after this many consecutive pages with NO un-sent invoice
+MAX_PAGES = 300            # hard safety limit for page walking (anti infinite loop)
+
+SEND_TIMEOUT = 90          # seconds to wait for each send to finish
+AFTER_SEND_WAIT = 5        # seconds to wait AFTER a successful send, before opening its inquiry
+INQUIRY_SETTLE = 10        # seconds to wait for each inquiry answer
+INQUIRY_ROUNDS = 2         # inquiry rounds for invoices still pending
+ROUND_WAIT = 45            # seconds between inquiry rounds
+PAGE_WAIT_MAX = 12         # max seconds to wait for the table to change after clicking next/prev
+PAGE_SETTLE = 2.0          # extra seconds after the table changed (let buttons render)
+DELAY_BETWEEN = 4.0        # pause between invoices (increase if Moadian still errors out)
+# ================================================================
+
+Z = r"[\s\u200c]*"
 RE_PENDING = re.compile(rf"در{Z}انتظار|ارسال{Z}شده")
 RE_DONE = re.compile(rf"ثبت{Z}در{Z}سامانه")
 RE_CONFIRM_TEXT = re.compile(r"سامانه\s*م.{1,2}دیان\s*فرستاده\s*شود")
 RE_CONFIRM_BTN = re.compile(r"^\s*ت\S{0,2}ی+د\s*$")
-RE_INVOICE_NO = re.compile(r"^[0-9۰-۹]{8,14}$")
+SEND_BTN = 'button[aria-label^="ارسال فاکتور"]'
+
+_FA2EN_JS = r"""const fa2en = (s) => s.replace(/[\u06F0-\u06F9\u0660-\u0669]/g,
+                                 d => String(d.charCodeAt(0) & 0xF));"""
+
+# Index of the <tr> whose invoice-number cell ends with `wanted` (ASCII digits).
+JS_FIND_ROW_BY_NUMBER = r"""
+(wanted) => {
+  """ + _FA2EN_JS + r"""
+  const trs = document.querySelectorAll('tr');
+  for (let i = 0; i < trs.length; i++) {
+    const tds = trs[i].querySelectorAll('td');
+    for (const td of tds) {
+      const t = fa2en(td.textContent.trim());
+      if (/^[0-9]{8,14}$/.test(t) && t.endsWith(wanted)) return i;
+    }
+  }
+  return -1;
+}
+"""
+
+# "Signature" of the current table page = list of invoice numbers shown.
+# Used to know whether next/prev really changed the page (loop guard).
+JS_PAGE_SIG = r"""
+() => {
+  """ + _FA2EN_JS + r"""
+  const out = [];
+  document.querySelectorAll('tr').forEach(tr => {
+    for (const td of tr.querySelectorAll('td')) {
+      const t = fa2en(td.textContent.trim());
+      if (/^[0-9]{8,14}$/.test(t)) { out.push(t); break; }
+    }
+  });
+  return out.join(',');
+}
+"""
 
 
-# --------------------------- ابزارهای کمکی ---------------------------
-def row_number(row):
-    try:
-        for txt in row.locator("td").all_inner_texts():
-            t = txt.strip()
-            if RE_INVOICE_NO.match(t):
-                return t
-    except Exception:
-        pass
+def say(msg):
+    print(msg)
+    sys.stdout.flush()
+
+
+def a(s):
+    """Convert any Unicode digits (Persian/Arabic) to ASCII digits."""
+    out = []
+    for c in (s or ""):
+        if c.isdigit():
+            try:
+                out.append(str(unicodedata.digit(c)))
+                continue
+            except ValueError:
+                pass
+        out.append(c)
+    return "".join(out)
+
+
+def num_key(n):
+    d = re.sub(r"[^0-9]", "", a(n))
+    return int(d) if d else 10 ** 18
+
+
+# --------------------------- overlay ("سامانه مؤدیان" popup) ---------------------------
+def overlay(page):
+    ov = page.locator(".personnel-overlay")
+    for i in range(ov.count()):
+        if ov.nth(i).is_visible():
+            return ov.nth(i)
     return None
 
 
-def click_status_button(row, rx):
-    cell = row.locator("td").filter(has_text=rx).first
-    btn = cell.locator("button")
-    if btn.count():
-        btn.first.click()
-    else:
-        cell.get_by_text(rx).first.click()
-
-
-def get_modal(page):
-    return (
-        page.locator("div")
-        .filter(has=page.get_by_role("button", name="تغییر وضعیت", exact=True))
-        .filter(has_text="شماره مالیاتی")
-        .last
-    )
-
-
-def modal_text(page):
+def overlay_text(page):
+    ov = overlay(page)
+    if ov is None:
+        return None
     try:
-        return get_modal(page).inner_text(timeout=2000)
+        return ov.inner_text(timeout=2000)
     except Exception:
         return ""
 
 
-def close_modal(page):
+def close_overlay(page):
+    for _ in range(4):
+        ov = overlay(page)
+        if ov is None:
+            return True
+        try:
+            ov.get_by_role("button", name="بستن", exact=True).first.click(timeout=2000)
+        except Exception:
+            try:
+                page.keyboard.press("Escape")
+                ov.locator("button").first.evaluate("e => e.click()")
+            except Exception:
+                pass
+        time.sleep(0.6)
+    return overlay(page) is None
+
+
+def wait_and_close_overlay(page, wait=4):
+    text = ""
+    end = time.time() + wait
+    while time.time() < end:
+        t = overlay_text(page)
+        if t is not None:
+            text = t
+            break
+        time.sleep(0.3)
+    close_overlay(page)
+    return " | ".join(x.strip() for x in text.splitlines() if x.strip())[:300]
+
+
+def safe_click(page, locator):
+    close_overlay(page)
     try:
-        page.get_by_role("button", name="بستن", exact=True).first.click(timeout=3000)
+        locator.click(timeout=5000)
     except Exception:
-        page.keyboard.press("Escape")
+        locator.evaluate("e => e.click()")
+
+
+def wait_for_refresh(page, timeout=15):
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=timeout * 1000)
+    except Exception:
+        pass
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout * 1000)
+    except Exception:
+        pass
     time.sleep(0.5)
 
 
@@ -88,328 +191,82 @@ def classify(text):
     return "other"
 
 
-def next_page(page):
-    btn = page.get_by_role("button", name="بعدی", exact=True)
-    if btn.count() == 0 or not btn.first.is_enabled():
-        return False
-    btn.first.click()
-    time.sleep(PAGE_SETTLE)
-    return True
-
-
-def goto_first_page(page):
-    while True:
-        btn = page.get_by_role("button", name="قبلی", exact=True)
-        if btn.count() == 0 or not btn.first.is_enabled():
-            return
-        btn.first.click()
-        time.sleep(PAGE_SETTLE)
-
-
-def for_each_page(page, fn):
-    goto_first_page(page)
-    page_no = 1
-    while True:
-        print(f"\n--- صفحه {page_no} ---")
-        if fn(page) == "stop" or STOP.is_set():
-            return
-        if not next_page(page):
-            return
-        page_no += 1
-
-
-def pick_row(page, rx, skip):
-    rows = page.locator(ROW).filter(has_text=rx)
-    for i in range(rows.count()):
-        r = rows.nth(i)
-        n = row_number(r) or f"row{i}"
-        if n not in skip:
-            return r, n
-    return None, None
-
-
-# --------------------------- مرحله‌ی ارسال ---------------------------
-def send_pass(page, log, state):
-    failed = set()
-    while True:
-        if STOP.is_set():
-            return "stop"
-        if MAX_SEND is not None and state["sent"] >= MAX_SEND:
-            return "stop"
-        row, num = pick_row(page, RE_UNSENT, failed)
-        if row is None:
-            return
-        rows = page.locator(ROW).filter(has_text=RE_UNSENT)
-        before = rows.count()
-        try:
-            click_status_button(row, RE_UNSENT)
-            page.get_by_text(RE_CONFIRM_TEXT).wait_for(timeout=10000)
-            page.get_by_role("button", name=RE_CONFIRM_BTN).last.click()
-
-            deadline = time.time() + SEND_TIMEOUT
-            while time.time() < deadline and rows.count() >= before:
-                time.sleep(0.5)
-            if rows.count() >= before:
-                raise TimeoutError("وضعیت ردیف بعد از تأیید تغییر نکرد")
-
-            state["sent"] += 1
-            print(f"[ارسال] {num} ✔")
-            log.writerow([num, "send", "ok", ""])
-        except Exception as e:
-            failed.add(num)
-            print(f"[ارسال] {num} ✘ {e}")
-            log.writerow([num, "send", "error", str(e)])
-            try:
-                page.screenshot(path=f"error_send_{num}.png")
-            except Exception:
-                pass
-            page.keyboard.press("Escape")
-        time.sleep(DELAY_BETWEEN)
-
-
-# --------------------------- مرحله‌ی استعلام ---------------------------
-def inquiry_pass(page, log, state):
-    seen = set()
-    while True:
-        if STOP.is_set():
-            return "stop"
-        row, num = pick_row(page, RE_PENDING, seen)
-        if row is None:
-            return
-        seen.add(num)
-        try:
-            click_status_button(row, RE_PENDING)
-            get_modal(page).wait_for(state="visible", timeout=10000)
-            page.get_by_role("button", name="استعلام وضعیت", exact=True).click()
-
-            deadline = time.time() + INQUIRY_SETTLE
-            text = modal_text(page)
-            while time.time() < deadline and classify(text) == "pending":
-                time.sleep(0.5)
-                text = modal_text(page)
-
-            status = classify(text)
-            clean = " | ".join(x.strip() for x in text.splitlines() if x.strip())[:400]
-            if status == "done":
-                state["done"] += 1
-                warn = "هشدار" in text
-                print(f"[استعلام] {num} ✔ ثبت شد" + (" (با هشدار)" if warn else ""))
-                log.writerow([num, "inquiry", "done_warning" if warn else "done", clean])
-            elif status == "pending":
-                state["pending"] += 1
-                print(f"[استعلام] {num} … هنوز در انتظار")
-                log.writerow([num, "inquiry", "pending", ""])
-            else:
-                state["other"] += 1
-                print(f"[استعلام] {num} ⚠ وضعیت نامشخص/رد شده: {clean}")
-                log.writerow([num, "inquiry", "other", clean])
-                page.screenshot(path=f"inquiry_other_{num}.png")
-        except Exception as e:
-            state["other"] += 1
-            print(f"[استعلام] {num} ✘ {e}")
-            log.writerow([num, "inquiry", "error", str(e)])
-            try:
-                page.screenshot(path=f"error_inquiry_{num}.png")
-            except Exception:
-                pass
-        finally:
-            close_modal(page)
-        time.sleep(DELAY_BETWEEN)
-
-
-# ------------------------------- main -------------------------------
-def main():
-    fname = f"kariya_log_{datetime.now():%Y%m%d_%H%M%S}.csv"
-    state = {"sent": 0, "done": 0, "pending": 0, "other": 0}
-
-    with sync_playwright() as p, open(fname, "w", newline="", encoding="utf-8-sig") as f:
-        log = csv.writer(f)
-        log.writerow(["invoice", "action", "result", "detail"])
-
-        browser = p.chromium.connect_over_cdp(CDP_URL)
-        page = None
-        for ctx in browser.contexts:
-            for pg in ctx.pages:
-                if PAGE_URL_PART in pg.url:
-                    page = pg
-        if page is None:
-            print("تب کاریا حساب پیدا نشد. اول لاگین کنید و صفحه‌ی «فاکتور فروش» را باز بگذارید.")
-            return
-
-        page.set_default_timeout(15000)
-        page.bring_to_front()
-
-        if DO_SEND:
-            print("===== مرحله‌ی ارسال =====")
-            for_each_page(page, lambda pg: send_pass(pg, log, state))
-
-        if DO_INQUIRY and not STOP.is_set():
-            for rnd in range(1, INQUIRY_ROUNDS + 1):
-                print(f"\n===== مرحله‌ی استعلام (دور {rnd}) =====")
-                state["pending"] = 0
-                for_each_page(page, lambda pg: inquiry_pass(pg, log, state))
-                if state["pending"] == 0 or STOP.is_set():
-                    break
-                if rnd < INQUIRY_ROUNDS:
-                    print(f"{state['pending']} فاکتور هنوز در انتظار است؛ {ROUND_WAIT} ثانیه صبر…")
-                    time.sleep(ROUND_WAIT)
-
-        print("\n===== خلاصه =====")
-        print(f"ارسال‌شده: {state['sent']} | ثبت‌شده: {state['done']} | "
-              f"هنوز در انتظار: {state['pending']} | مشکل‌دار: {state['other']}")
-        print(f"گزارش کامل: {fname}")
-SEND_BTN = 'button[aria-label^="ارسال فاکتور"]'
-
-
-def overlay_visible(page):
-    ov = page.locator("div.overlay[role='presentation']")
-    for i in range(ov.count()):
-        if ov.nth(i).is_visible():
-            return ov.nth(i)
-    return None
-
-
-def clear_overlays(page):
-    for _ in range(3):
-        ov = overlay_visible(page)
-        if ov is None:
-            return
-        try:
-            print("  ⚠ overlay:", ov.evaluate("e => e.outerHTML.slice(0, 200)"))
-        except Exception:
-            pass
-        page.keyboard.press("Escape")
-        time.sleep(0.5)
-        ov = overlay_visible(page)
-        if ov is not None:
-            try:
-                ov.click(position={"x": 5, "y": 5}, timeout=2000)
-            except Exception:
-                pass
-            time.sleep(0.5)
-
-
-def safe_click(page, locator):
-    if page is not None:
-        clear_overlays(page)
+# --------------------------- paging (with loop guard) ---------------------------
+def page_sig(page):
     try:
-        locator.click(timeout=5000)
-    except Exception:
-        locator.evaluate("e => e.click()")   # کلیک مستقیم، بدون گیر کردن به overlay
-
-
-def click_status_button(row, rx):
-    cell = row.locator("td").filter(has_text=rx).first
-    btn = cell.locator("button")
-    target = btn.first if btn.count() else cell.get_by_text(rx).first
-    safe_click(getattr(row, "page", None), target)
-
-
-def send_pass(page, log, state):
-    failed = set()
-    while True:
-        if STOP.is_set():
-            return "stop"
-        if MAX_SEND is not None and state["sent"] >= MAX_SEND:
-            return "stop"
-
-        btns = page.locator(SEND_BTN)
-        target = label = num = None
-        for i in range(btns.count()):
-            b = btns.nth(i)
-            lab = b.get_attribute("aria-label") or ""
-            n = lab.replace("ارسال فاکتور", "").strip() or f"btn{i}"
-            if n not in failed:
-                target, label, num = b, lab, n
-                break
-        if target is None:
-            return
-
-        try:
-            safe_click(page, target)
-            page.get_by_text(RE_CONFIRM_TEXT).wait_for(timeout=10000)
-            page.get_by_role("button", name=RE_CONFIRM_BTN).last.click()
-
-            same = page.locator(f'button[aria-label="{label}"]')
-            deadline = time.time() + SEND_TIMEOUT
-            while time.time() < deadline and same.count() > 0:
-                time.sleep(0.5)
-            if same.count() > 0:
-                raise TimeoutError("دکمه‌ی ارسال بعد از تأیید همچنان وجود دارد")
-
-            state["sent"] += 1
-            print(f"[ارسال] {num} ✔")
-            log.writerow([num, "send", "ok", ""])
-        except Exception as e:
-            failed.add(num)
-            print(f"[ارسال] {num} ✘ {str(e)[:200]}")
-            log.writerow([num, "send", "error", str(e)[:200]])
-            try:
-                page.screenshot(path=f"error_send_{num}.png")
-            except Exception:
-                pass
-            page.keyboard.press("Escape")
-        time.sleep(DELAY_BETWEEN)
-def overlay_visible(page):
-    ov = page.locator(".personnel-overlay")
-    for i in range(ov.count()):
-        if ov.nth(i).is_visible():
-            return ov.nth(i)
-    return None
-
-
-def close_modal(page):
-    """پنجره‌ی سامانه مؤدیان را می‌بندد (با دکمه‌ی «بستن»)."""
-    for _ in range(4):
-        if overlay_visible(page) is None:
-            return True
-        ov = page.locator(".personnel-overlay")
-        try:
-            ov.get_by_role("button", name="بستن", exact=True).first.click(timeout=2000)
-        except Exception:
-            try:
-                page.keyboard.press("Escape")
-                ov.locator("button").first.evaluate("e => e.click()")
-            except Exception:
-                pass
-        time.sleep(0.6)
-    return overlay_visible(page) is None
-
-
-def wait_and_close_modal(page, wait=4):
-    """بعد از ارسال منتظر باز شدن پنجره می‌ماند، متنش را برمی‌گرداند و می‌بندد."""
-    end = time.time() + wait
-    text = ""
-    while time.time() < end:
-        ov = overlay_visible(page)
-        if ov is not None:
-            try:
-                text = ov.inner_text(timeout=2000)
-            except Exception:
-                pass
-            break
-        time.sleep(0.3)
-    close_modal(page)
-    return " | ".join(x.strip() for x in text.splitlines() if x.strip())[:300]
-
-
-def get_modal(page):
-    return page.locator(".personnel-overlay").first
-
-
-def modal_text(page):
-    try:
-        return get_modal(page).inner_text(timeout=2000)
+        return page.evaluate(JS_PAGE_SIG)
     except Exception:
         return ""
 
 
-def safe_click(page, locator):
-    close_modal(page)
-    try:
-        locator.click(timeout=5000)
-    except Exception:
-        locator.evaluate("e => e.click()")
+def turn_page(page, name):
+    """
+    Click the 'next'/'previous' button. Returns True ONLY if the table content
+    really changed. If the button is missing/disabled, or the click did not change
+    the table (we are at a boundary), returns False -> callers never loop forever.
+    """
+    close_overlay(page)
+    btn = page.get_by_role("button", name=name, exact=True)
+    if btn.count() == 0 or not btn.first.is_enabled():
+        return False
+    before = page_sig(page)
+    safe_click(page, btn.first)
+    end = time.time() + PAGE_WAIT_MAX
+    while time.time() < end:
+        time.sleep(0.4)
+        if page_sig(page) != before:
+            time.sleep(PAGE_SETTLE)
+            return True
+    return False
+
+
+def next_page(page):
+    return turn_page(page, "بعدی")
+
+
+def prev_page(page):
+    return turn_page(page, "قبلی")
+
+
+def goto_first_page(page):
+    for _ in range(MAX_PAGES):
+        if not prev_page(page):
+            return
+
+
+def find_row_index(page, wanted):
+    return page.evaluate(JS_FIND_ROW_BY_NUMBER, a(wanted))
+
+
+def goto_page_of_invoice(page, wanted, limit):
+    """
+    Make the page holding invoice `wanted` the visible one.
+    1) fast path: it is already on the current page
+    2) otherwise go to page 1 and walk forward, but NEVER beyond `limit` pages
+       (older pages are not scanned at all).
+    """
+    wanted = a(wanted)
+    if find_row_index(page, wanted) >= 0:
+        return True
+    goto_first_page(page)
+    pos = 1
+    while True:
+        if find_row_index(page, wanted) >= 0:
+            return True
+        if pos >= limit or pos >= MAX_PAGES:
+            return False
+        if not next_page(page):
+            return False
+        pos += 1
+
+
+def locate_row(page, n, limit):
+    if not goto_page_of_invoice(page, n, limit):
+        return None
+    idx = find_row_index(page, n)
+    if idx is None or idx < 0:
+        return None
+    return page.locator("tr").nth(idx)
 
 
 def click_status_button(row, rx):
@@ -419,82 +276,302 @@ def click_status_button(row, rx):
     safe_click(row.page, target)
 
 
-def next_page(page):
-    close_modal(page)
-    btn = page.get_by_role("button", name="بعدی", exact=True)
-    if btn.count() == 0 or not btn.first.is_enabled():
+def screenshot(page, name):
+    try:
+        page.screenshot(path=name)
+    except Exception:
+        pass
+
+
+# ------------------------------ send one invoice ------------------------------
+def send_one(page, log, st, target, label, num):
+    """Click the send button, confirm, and wait for it to disappear. Returns True on success."""
+    try:
+        safe_click(page, target)
+        page.get_by_text(RE_CONFIRM_TEXT).wait_for(timeout=10000)
+        page.get_by_role("button", name=RE_CONFIRM_BTN).last.click()
+
+        same = page.locator('button[aria-label="%s"]' % label)
+        deadline = time.time() + SEND_TIMEOUT
+        while time.time() < deadline and same.count() > 0:
+            time.sleep(0.5)
+        if same.count() > 0:
+            raise TimeoutError("send button still present after confirm")
+
+        info = wait_and_close_overlay(page)
+        st["sent"] += 1
+        say("[SEND] %s OK" % a(num))
+        log.writerow([a(num), "send", "ok", info])
+        return True
+    except Exception as e:
+        say("[SEND] %s FAILED: %s" % (a(num), str(e)[:150]))
+        log.writerow([a(num), "send", "error", str(e)[:200]])
+        screenshot(page, "error_send_%s.png" % a(num))
+        close_overlay(page)
         return False
-    safe_click(page, btn.first)
-    time.sleep(PAGE_SETTLE)
-    return True
 
 
-def goto_first_page(page):
+# ------------------------------ inquire one invoice ------------------------------
+def inquire_one(page, log, st, row, num):
+    """Open the status popup for this row, click 'استعلام وضعیت', read the result."""
+    try:
+        click_status_button(row, RE_PENDING)
+        end = time.time() + 10
+        while time.time() < end and overlay(page) is None:
+            time.sleep(0.3)
+        if overlay(page) is None:
+            raise TimeoutError("status window did not open")
+
+        if not page.evaluate(
+            """() => {
+                const ov = [...document.querySelectorAll('.personnel-overlay')]
+                    .find(o => o.getBoundingClientRect().width > 0);
+                if (!ov) return false;
+                const b = [...ov.querySelectorAll('button')]
+                    .find(x => x.textContent.trim() === 'استعلام وضعیت');
+                if (!b) return false;
+                b.click(); return true;
+            }"""
+        ):
+            raise TimeoutError("inquiry button not found")
+
+        text = overlay_text(page) or ""
+        deadline = time.time() + INQUIRY_SETTLE
+        while time.time() < deadline and classify(text) == "pending":
+            time.sleep(0.5)
+            text = overlay_text(page) or ""
+
+        status = classify(text)
+        clean = " | ".join(x.strip() for x in text.splitlines() if x.strip())[:400]
+        if status == "done":
+            st["done"] += 1
+            warn = "هشدار" in text
+            say("[INQUIRY] %s DONE%s" % (a(num), " (with warning)" if warn else ""))
+            log.writerow([a(num), "inquiry", "done_warning" if warn else "done", clean])
+        elif status == "pending":
+            st["pending"] += 1
+            say("[INQUIRY] %s still pending" % a(num))
+            log.writerow([a(num), "inquiry", "pending", ""])
+        else:
+            st["other"] += 1
+            say("[INQUIRY] %s UNKNOWN/REJECTED (see CSV)" % a(num))
+            log.writerow([a(num), "inquiry", "other", clean])
+            screenshot(page, "inquiry_other_%s.png" % a(num))
+        return status
+    except Exception as e:
+        st["other"] += 1
+        say("[INQUIRY] %s FAILED: %s" % (a(num), str(e)[:150]))
+        log.writerow([a(num), "inquiry", "error", str(e)[:200]])
+        screenshot(page, "error_inquiry_%s.png" % a(num))
+        return "other"
+    finally:
+        close_overlay(page)
+
+
+# -------------------- collect un-sent invoices (limited scan) --------------------
+def collect_unsent_numbers(page):
+    """
+    Walk pages from page 1 (newest). Stop when STOP_AFTER_EMPTY_PAGES consecutive
+    pages contain no un-sent invoice. Returns (list_of_numbers, pages_scanned).
+    """
+    numbers = []
+    seen = set()
+    goto_first_page(page)
+    page_no = 1
+    empty_streak = 0
     while True:
-        close_modal(page)
-        btn = page.get_by_role("button", name="قبلی", exact=True)
-        if btn.count() == 0 or not btn.first.is_enabled():
-            return
-        safe_click(page, btn.first)
-        time.sleep(PAGE_SETTLE)
-
-
-SEND_BTN = 'button[aria-label^="ارسال فاکتور"]'
-
-
-def send_pass(page, log, state):
-    failed = set()
-    while True:
-        if STOP.is_set():
-            return "stop"
-        if MAX_SEND is not None and state["sent"] >= MAX_SEND:
-            return "stop"
-
-        close_modal(page)
+        close_overlay(page)
         btns = page.locator(SEND_BTN)
-        target = label = num = None
-        for i in range(btns.count()):
-            b = btns.nth(i)
-            lab = b.get_attribute("aria-label") or ""
-            n = lab.replace("ارسال فاکتور", "").strip() or f"btn{i}"
-            if n not in failed:
-                target, label, num = b, lab, n
-                break
-        if target is None:
-            return
+        cnt = btns.count()
+        for i in range(cnt):
+            lab = btns.nth(i).get_attribute("aria-label") or ""
+            n = a(lab.replace("ارسال فاکتور", "").strip())
+            if n and n not in seen:
+                seen.add(n)
+                numbers.append(n)
+        say("  page %d: %d un-sent button(s)" % (page_no, cnt))
+
+        empty_streak = empty_streak + 1 if cnt == 0 else 0
+        if empty_streak >= STOP_AFTER_EMPTY_PAGES:
+            say("  %d consecutive pages without un-sent invoices -> stop scanning."
+                % STOP_AFTER_EMPTY_PAGES)
+            break
+        if page_no >= MAX_PAGES:
+            say("  reached MAX_PAGES, stop scanning.")
+            break
+        if not next_page(page):
+            say("  last page reached.")
+            break
+        page_no += 1
+    return numbers, page_no
+
+
+def send_all_in_order(page, log, st):
+    """
+    Smallest invoice number first. For EACH invoice:
+        1) send it
+        2) wait for the table to refresh
+        3) inquire that same invoice
+        4) only then move to the next invoice
+    Returns the list of invoice numbers whose inquiry is still 'pending'
+    plus the page limit used for locating rows.
+    """
+    say("Scanning for un-sent invoices ...")
+    unsent, scanned = collect_unsent_numbers(page)
+    limit = scanned + 1            # small slack in case a new invoice shifts rows
+    pending_nums = []
+    if not unsent:
+        say("No un-sent invoices found.")
+        return pending_nums, limit
+    unsent.sort(key=num_key)
+
+    say("\nFound %d un-sent invoice(s) in %d page(s). Processing order (smallest first):"
+        % (len(unsent), scanned))
+    head = unsent[:10]
+    for n in head:
+        say("  %s" % n)
+    if len(unsent) > len(head):
+        say("  ... (+%d more)" % (len(unsent) - len(head)))
+
+    for n in unsent:
+        if MAX_SEND is not None and st["sent"] >= MAX_SEND:
+            say("Reached --max limit (%d). Stopping send phase." % MAX_SEND)
+            break
+
+        say("\n=== invoice %s ===" % n)
+        close_overlay(page)
+
+        # ---- 1) SEND ----
+        row = locate_row(page, n, limit)
+        if row is None:
+            say("[SEND] %s not found in the scanned pages, skipping" % n)
+            log.writerow([n, "send", "skip", "not in table"])
+            continue
+
+        btn = row.locator(SEND_BTN)
+        if btn.count() == 0:
+            say("[SEND] %s already sent, skipping send" % n)
+            log.writerow([n, "send", "skip", "already sent"])
+        else:
+            label = btn.first.get_attribute("aria-label") or ""
+            if not send_one(page, log, st, btn.first, label, n):
+                time.sleep(DELAY_BETWEEN)
+                continue
+            say("waiting for refresh before checking %s ..." % n)
+            wait_for_refresh(page)
+            time.sleep(AFTER_SEND_WAIT)
+
+        # ---- 2) INQUIRY of the same invoice ----
+        if DO_INQUIRY:
+            row = locate_row(page, n, limit)
+            if row is None:
+                say("[INQUIRY] %s row not found for inquiry" % n)
+                log.writerow([n, "inquiry", "error", "row not found"])
+            elif inquire_one(page, log, st, row, n) == "pending":
+                pending_nums.append(n)
+
+        # ---- 3) next invoice ----
+        time.sleep(DELAY_BETWEEN)
+    return pending_nums, limit
+
+
+# ------------------------- extra rounds ONLY for this run's pending invoices -------------------------
+def inquiry_round(page, log, st, nums, limit):
+    still = []
+    for n in nums:
+        close_overlay(page)
+        row = locate_row(page, n, limit)
+        if row is None:
+            say("[INQUIRY] %s row not found" % n)
+            log.writerow([n, "inquiry", "error", "row not found"])
+            continue
+        if inquire_one(page, log, st, row, n) == "pending":
+            still.append(n)
+        time.sleep(DELAY_BETWEEN)
+    return still
+
+
+# --------------------------------- main ---------------------------------
+def main():
+    print(">>> kariya bot starting ...", flush=True)
+    global MAX_SEND
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--max", type=int, default=None, help="max invoices to send (test)")
+    args = ap.parse_args()
+    if args.max:
+        MAX_SEND = args.max
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    fname = os.path.join(here, "kariya_log_%s.csv" % datetime.now().strftime("%Y%m%d_%H%M%S"))
+    st = {"sent": 0, "done": 0, "pending": 0, "other": 0}
+
+    with sync_playwright() as p, open(fname, "w", newline="", encoding="utf-8-sig") as f:
+        log = csv.writer(f)
+        log.writerow(["invoice", "action", "result", "detail"])
 
         try:
-            safe_click(page, target)
-            page.get_by_text(RE_CONFIRM_TEXT).wait_for(timeout=10000)
-            page.get_by_role("button", name=RE_CONFIRM_BTN).last.click()
-
-            same = page.locator(f'button[aria-label="{label}"]')
-            deadline = time.time() + SEND_TIMEOUT
-            while time.time() < deadline and same.count() > 0:
-                time.sleep(0.5)
-            if same.count() > 0:
-                raise TimeoutError("دکمه‌ی ارسال بعد از تأیید همچنان وجود دارد")
-
-            info = wait_and_close_modal(page)
-            state["sent"] += 1
-            print(f"[ارسال] {num} ✔")
-            log.writerow([num, "send", "ok", info])
+            browser = p.chromium.connect_over_cdp(CDP_URL)
         except Exception as e:
-            failed.add(num)
-            print(f"[ارسال] {num} ✘ {str(e)[:200]}")
-            log.writerow([num, "send", "error", str(e)[:200]])
-            try:
-                page.screenshot(path=f"error_send_{num}.png")
-            except Exception:
-                pass
-            close_modal(page)
-        time.sleep(DELAY_BETWEEN)
-STOP.clear()
-t = threading.Thread(target=main, daemon=True)
-t.start()
-try:
-    t.join()
-except KeyboardInterrupt:
-    STOP.set()
-    print("درخواست توقف ثبت شد؛ بعد از پایان فاکتور جاری متوقف می‌شود…")
-    t.join()
+            say("Could not connect to Chrome on %s: %s" % (CDP_URL, e))
+            say("Make sure the bot's Chrome window (opened by the .bat) is still open,")
+            say("and that Chrome was started with --remote-debugging-port=9222 AND a")
+            say('separate --user-data-dir (required since Chrome 136), e.g. --user-data-dir="C:\\kariya_profile"')
+            say("Test: open http://127.0.0.1:9222/json/version in a browser tab.")
+            return 1
+
+        page = None
+        for ctx in browser.contexts:
+            for pg in ctx.pages:
+                if URL_PART in pg.url:
+                    page = pg
+        if page is None:
+            say("Kariya tab not found. Log in and open the Sales Invoices page first.")
+            return 1
+
+        page.set_default_timeout(15000)
+        page.bring_to_front()
+
+        try:
+            pending_nums, limit = [], 1
+            if DO_SEND:
+                say("===== SEND + INQUIRY (smallest invoice first, one by one) =====")
+                pending_nums, limit = send_all_in_order(page, log, st)
+
+            if DO_INQUIRY:
+                for rnd in range(2, INQUIRY_ROUNDS + 1):
+                    if not pending_nums:
+                        break
+                    say("\n===== EXTRA INQUIRY ROUND %d (%d still pending) ====="
+                        % (rnd, len(pending_nums)))
+                    say("waiting %d s before re-checking..." % ROUND_WAIT)
+                    time.sleep(ROUND_WAIT)
+                    st["pending"] = 0
+                    pending_nums = inquiry_round(page, log, st, pending_nums, limit)
+        except KeyboardInterrupt:
+            say("\nStopped by user.")
+
+    say("\n===== SUMMARY =====")
+    say("sent: %d | registered: %d | still pending: %d | problems: %d"
+        % (st["sent"], st["done"], st["pending"], st["other"]))
+    say("full report: %s" % fname)
+    return 0
+
+
+if __name__ == "__main__":
+    rc = 1
+    try:
+        rc = main()
+    except SystemExit:
+        raise
+    except BaseException:
+        print("\n" + "=" * 60)
+        print("UNEXPECTED ERROR - full traceback below:")
+        print("=" * 60)
+        traceback.print_exc()
+        print("=" * 60)
+    finally:
+        try:
+            input("\nPress Enter to close this window ...")
+        except Exception:
+            pass
+    sys.exit(rc)
