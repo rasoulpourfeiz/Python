@@ -1,0 +1,5 @@
+openpyxl
+pynput
+pyperclip
+pygetwindow
+python -m pip install --upgrade pip
